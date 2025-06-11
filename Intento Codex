@@ -1,0 +1,529 @@
+import feedparser
+import os
+from openai import OpenAI
+import logging
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+from datetime import datetime, timedelta
+from dateutil import parser
+from collections import defaultdict
+import re
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('boletin_processor.log'),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+
+def scrape_senado():
+    # URL de la página
+    url = "https://www.senado.gob.ar/parlamentario/comisiones/?active=permanente"
+
+    try:
+        print("Accediendo a la URL:", url)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+
+        print("Procesando contenido...")
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Lista para almacenar todas las reuniones
+        reuniones = []
+
+        # Encontrar la tabla de agenda de reuniones
+        # La tabla está después del encabezado "Agenda de Reuniones"
+        agenda_header = soup.find('h1', string='Agenda de Reuniones')
+        if not agenda_header:
+            print("⚠️ No se encontró la sección de agenda")
+            return None
+
+        # Buscar la tabla después del encabezado
+        tabla = agenda_header.find_next('table')
+        if not tabla:
+            print("⚠️ No se encontró la tabla de reuniones")
+            return None
+
+        # Procesar las filas de la tabla
+        rows = tabla.find_all('tr')
+        print(f"Se encontraron {len(rows)} filas en la tabla")
+
+        for row in rows:
+            # Obtener todas las celdas de la fila
+            cells = row.find_all('td')
+
+            if len(cells) == 3:  # La tabla tiene 3 columnas: Comisión, Día y Hora, Próxima Reunión
+                comision = cells[0].get_text(strip=True)
+                dia_hora = cells[1].get_text(strip=True)
+                agenda_link = cells[2].find('a')['href'] if cells[2].find('a') else ""
+
+                # Procesar día y hora
+                # El formato suele ser "ASESORES - Día de la semana DD de mes - HH:mm h"
+                dia_hora_parts = dia_hora.split('-')
+                tipo_reunion = dia_hora_parts[0].strip() if len(dia_hora_parts) > 1 else ""
+
+                # Extraer fecha y hora usando expresiones regulares
+                fecha_match = re.search(r'(\w+\s+\d+\s+de\s+\w+)', dia_hora)
+                hora_match = re.search(r'(\d{1,2}:\d{2})\s*h', dia_hora)
+
+                fecha = fecha_match.group(1) if fecha_match else ""
+                hora = hora_match.group(1) if hora_match else ""
+
+                reunion = {
+                    'comision': comision,
+                    'tipo_reunion': tipo_reunion,
+                    'fecha': fecha,
+                    'hora': hora,
+                    'dia_hora_completo': dia_hora,
+                    'agenda_url': f"https://www.senado.gob.ar{agenda_link}" if agenda_link else ""
+                }
+
+                reuniones.append(reunion)
+                print(f"\n✓ Nueva reunión encontrada:")
+                print(f"  Comisión: {comision}")
+                print(f"  Tipo: {tipo_reunion}")
+                print(f"  Fecha: {fecha}")
+                print(f"  Hora: {hora}")
+
+        print(f"\nTotal de reuniones encontradas: {len(reuniones)}")
+
+        if not reuniones:
+            print("⚠️ No se encontraron reuniones")
+            return None
+
+        # Crear DataFrame
+        df = pd.DataFrame(reuniones)
+
+        # Guardar en CSV
+        filename = f'agenda_senado_{datetime.now().strftime("%Y%m%d_%H%M")}.csv'
+        df.to_csv(filename, index=False, encoding='utf-8-sig')
+        print(f"\n✅ Datos guardados exitosamente en {filename}")
+
+        # Mostrar las primeras filas del DataFrame
+        print("\nPrimeras entradas del DataFrame:")
+        print(df.head())
+
+        return df
+
+    except Exception as e:
+        print(f"❌ Error durante el procesamiento: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return None
+
+
+def scrape_comisiones():
+    # URL de la página
+    url = "https://www.hcdn.gov.ar/comisiones/agenda/"
+
+    try:
+        print("Accediendo a la URL:", url)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+
+        print("Procesando contenido...")
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Lista para almacenar todas las reuniones
+        reuniones = []
+        fecha_actual = None
+
+        # Encontrar la tabla principal
+        tabla = soup.find('table')
+        if not tabla:
+            print("⚠️ No se encontró ninguna tabla en la página")
+            return None
+
+        # Encontrar todas las filas de la tabla
+        rows = tabla.find_all('tr')
+        print(f"Se encontraron {len(rows)} filas en la tabla")
+
+        # Debug: Mostrar el HTML de las filas que podrían contener fechas
+        print("\nExaminando filas para fechas:")
+        for row in rows:
+            if len(row.find_all('td')) != 2:  # Si no tiene dos celdas, podría ser una fecha
+                print("\nPosible fila de fecha:")
+                print(row.prettify())
+
+        # Procesar las filas
+        for row in rows:
+            # Primero intentamos encontrar si es una fila de fecha (th)
+            th = row.find('th')
+            if th and th.get('colspan') == '2':
+                texto_fecha = th.get_text(strip=True)
+                if any(dia in texto_fecha.lower() for dia in ['lunes', 'martes', 'miércoles', 'jueves', 'viernes']):
+                    fecha_actual = texto_fecha
+                    print(f"\n📅 Nueva fecha encontrada: {fecha_actual}")
+                    continue
+
+            # Si no es fecha, procesamos como reunión si tiene dos celdas
+            cells = row.find_all('td')
+            if len(cells) == 2:
+                texto_celda1 = cells[0].get_text(strip=True)
+                texto_celda2 = cells[1].get_text(strip=True)
+
+                # Extraer hora y sala de la primera celda
+                hora_match = re.match(r'(\d{1,2}:\d{2})(.*)', texto_celda1)
+                if hora_match:
+                    hora = hora_match.group(1)
+                    sala = hora_match.group(2).strip()
+
+                    # Extraer comisión y descripción de la segunda celda
+                    partes = texto_celda2.split('.')
+                    comision = partes[0].strip()
+                    descripcion = '.'.join(partes[1:]).strip() if len(partes) > 1 else ''
+
+                    # Buscar el enlace de la citación
+                    citacion_link = cells[1].find('a', href=True)
+                    citacion_url = citacion_link['href'] if citacion_link else ""
+
+                    reunion = {
+                        'fecha': fecha_actual,
+                        'hora': hora,
+                        'sala': sala,
+                        'comision': comision,
+                        'descripcion': descripcion,
+                        'citacion_url': citacion_url
+                    }
+
+                    reuniones.append(reunion)
+                    print(f"\n✓ Nueva reunión encontrada:")
+                    print(f"  Fecha: {fecha_actual}")
+                    print(f"  Hora: {hora}")
+                    print(f"  Sala: {sala}")
+                    print(f"  Comisión: {comision}")
+                    print(f"  Descripción: {descripcion[:100]}...")
+
+        print(f"\nTotal de reuniones encontradas: {len(reuniones)}")
+
+        if not reuniones:
+            print("⚠️ No se encontraron reuniones")
+            return None
+
+        # Crear DataFrame
+        df = pd.DataFrame(reuniones)
+
+        # Guardar en CSV
+        filename = f'agenda_comisiones_{datetime.now().strftime("%Y%m%d_%H%M")}.csv'
+        df.to_csv(filename, index=False, encoding='utf-8-sig')
+        print(f"\n✅ Datos guardados exitosamente en {filename}")
+
+        # Mostrar las primeras filas del DataFrame
+        print("\nPrimeras entradas del DataFrame:")
+        print(df.head())
+
+        return df
+
+    except Exception as e:
+        print(f"❌ Error durante el procesamiento: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return None
+
+
+class BoletinDownloader:
+    """Clase para descargar el Boletín Oficial"""
+
+    def __init__(self):
+        self.base_url = "https://www.boletinoficial.gob.ar"
+        self.pdf_url_template = "https://www.boletinoficial.gob.ar/pdf/pdfPorNombre/{fecha}"
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+
+    def obtener_ultimo_boletin(self) -> tuple[str, str]:
+        """Obtiene la URL del último Boletín Oficial publicado"""
+        try:
+            logger.info("Obteniendo URL del último Boletín Oficial...")
+
+            # Obtener la fecha actual
+            fecha_actual = datetime.now()
+
+            # Si es fin de semana, retroceder al viernes
+            while fecha_actual.weekday() > 4:  # 5 = Sábado, 6 = Domingo
+                fecha_actual = fecha_actual - timedelta(days=1)
+
+            # Formatear la fecha para la URL
+            fecha_str = fecha_actual.strftime("%Y%m%d")
+
+            # Construir la URL del PDF
+            pdf_url = self.pdf_url_template.format(fecha=fecha_str)
+            nombre_archivo = f"boletin_{fecha_str}.pdf"
+
+            # Verificar si el PDF existe
+            response = requests.head(pdf_url, headers=self.headers)
+            if response.status_code == 404:
+                # Si no existe, probar con el día anterior
+                fecha_actual = fecha_actual - timedelta(days=1)
+                fecha_str = fecha_actual.strftime("%Y%m%d")
+                pdf_url = self.pdf_url_template.format(fecha=fecha_str)
+                nombre_archivo = f"boletin_{fecha_str}.pdf"
+
+                # Verificar nuevamente
+                response = requests.head(pdf_url, headers=self.headers)
+                if response.status_code == 404:
+                    raise ValueError(f"No se encontró el Boletín para la fecha {fecha_str}")
+
+            logger.info(f"URL del Boletín encontrada: {pdf_url}")
+            return pdf_url, nombre_archivo
+
+        except Exception as e:
+            logger.error(f"Error al obtener la URL del Boletín: {str(e)}")
+            raise
+
+
+def cargar_diccionario(path='Diccionario.xlsx'):
+    """Carga los temas y palabras clave desde un archivo Excel."""
+    if not os.path.exists(path):
+        print(f"Diccionario no encontrado: {path}")
+        return {}
+
+    df = pd.read_excel(path, engine='openpyxl')
+    temas = {}
+    for _, row in df.iterrows():
+        if pd.notna(row.iloc[0]):
+            tema = str(row.iloc[0]).strip()
+            temas.setdefault(tema, {'tema': tema, 'palabras_clave': []})
+            if len(row) > 1 and pd.notna(row.iloc[1]):
+                palabra = str(row.iloc[1]).strip().lower()
+                temas[tema]['palabras_clave'].append(palabra)
+    return temas
+
+
+def cargar_cuentas(path='Cuentas.xlsx'):
+    """Carga información de cuentas y sus temas asociados."""
+    if not os.path.exists(path):
+        print(f"Cuentas no encontradas: {path}")
+        return {}
+
+    df = pd.read_excel(path, engine='openpyxl')
+    cuentas = {}
+    for _, row in df.iterrows():
+        empresa = row.get('Empresa')
+        if pd.isna(empresa):
+            continue
+        empresa = str(empresa).strip()
+        cuentas.setdefault(empresa, {'nombre': empresa, 'temas': []})
+        for col in df.columns:
+            if col != 'Empresa' and pd.notna(row[col]):
+                tema = str(row[col]).strip()
+                if tema and tema not in cuentas[empresa]['temas']:
+                    cuentas[empresa]['temas'].append(tema)
+    return cuentas
+
+
+def es_de_hoy(date_str):
+    if not date_str:
+        return False
+    try:
+        published = parser.parse(date_str)
+        now = datetime.now()
+        return published.date() == now.date()
+    except Exception:
+        return False
+
+
+def obtener_noticias(feeds):
+    noticias = []
+    for nombre, url in feeds.items():
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries:
+                fecha = entry.published if 'published' in entry else entry.get('updated')
+                if es_de_hoy(fecha):
+                    noticias.append({
+                        'title': entry.title,
+                        'link': entry.link,
+                        'published': fecha,
+                        'feed_name': nombre
+                    })
+        except Exception as e:
+            print(f"Error procesando feed {nombre}: {e}")
+    return noticias
+
+
+def clasificar_noticias(noticias, temas):
+    noticias_por_tema = defaultdict(list)
+    for noticia in noticias:
+        titulo = noticia['title'].lower()
+        for tema, data in temas.items():
+            for palabra in data['palabras_clave']:
+                if palabra in titulo:
+                    noticia['palabra_encontrada'] = palabra
+                    noticias_por_tema[tema].append(noticia)
+                    break
+    return noticias_por_tema
+
+
+import os
+from openai import OpenAI
+
+def resumen_noticias(noticias):
+    client = OpenAI(api_key="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")
+    
+    texto = "\n".join(n['title'] for n in noticias[:20])
+    prompt = f"Resumí en detalle usando items, y juntando toda la información de cada tópico, el contexto político a partir de estos titulares:\n{texto}"
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=150,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Error al generar resumen: {e}"
+
+
+
+def obtener_agenda_senado():
+    df = scrape_senado()
+    if df is None:
+        return pd.DataFrame()
+    hoy = datetime.now().strftime('%d')
+    return df[df['fecha'].str.contains(hoy, na=False)]
+
+
+def obtener_agenda_diputados():
+    df = scrape_comisiones()
+    if df is None:
+        return pd.DataFrame()
+    hoy = datetime.now().strftime('%d')
+    return df[df['fecha'].str.contains(hoy, na=False)]
+
+
+def obtener_boletin():
+    try:
+        downloader = BoletinDownloader()
+        url, nombre = downloader.obtener_ultimo_boletin()
+        return url
+    except Exception as e:
+        return f"Error obteniendo boletín: {e}"
+
+
+def generar_reporte():
+    temas = cargar_diccionario()
+    cuentas = cargar_cuentas()
+
+    feeds = {
+            'infobae': 'https://www.infobae.com/feeds/rss/',
+            'clarin': 'https://www.clarin.com/rss/lo-ultimo/',
+            'lanacion_principal': 'https://www.lanacion.com.ar/arc/outboundfeeds/rss/?outputType=xml',
+            'lanacion_politica': 'https://www.lanacion.com.ar/arc/outboundfeeds/rss/categoria/politica/?outputType=xml',
+            'lanacion_economia': 'https://www.lanacion.com.ar/arc/outboundfeeds/rss/categoria/economia/?outputType=xml',
+            'lanacion_deportes': 'https://www.lanacion.com.ar/arc/outboundfeeds/rss/categoria/deportes/?outputType=xml',
+            'lanacion_sociedad': 'https://www.lanacion.com.ar/arc/outboundfeeds/rss/categoria/sociedad/?outputType=xml',
+            'lanacion_mundo': 'https://www.lanacion.com.ar/arc/outboundfeeds/rss/categoria/el-mundo/?outputType=xml',
+            'lanacion_tecnologia': 'https://www.lanacion.com.ar/arc/outboundfeeds/rss/categoria/tecnologia/?outputType=xml',
+            'lanacion_opinion': 'https://www.lanacion.com.ar/arc/outboundfeeds/rss/categoria/opinion/?outputType=xml',
+            'lanacion_lifestyle': 'https://www.lanacion.com.ar/arc/outboundfeeds/rss/categoria/lifestyle/?outputType=xml',
+            # La Política Online
+            'lpo_ultimas': 'http://www.lapoliticaonline.com.ar/files/rss/ultimasnoticias.xml',
+            'lpo_politica': 'http://www.lapoliticaonline.com.ar/files/rss/politica.xml',
+            'lpo_economia': 'http://www.lapoliticaonline.com.ar/files/rss/economia.xml',
+            # Feeds de medios regionales
+            'misiones_online': 'https://misionesonline.net/feed/',
+            'eldia': 'https://www.eldia.com/.rss',
+            'rionegro': 'https://www.rionegro.com.ar/feed/',
+            'diario_cuyo': 'https://www.diariodecuyo.com.ar/rss/rss.xml',
+            # Feeds de La Gaceta
+            'lagaceta_general': 'https://feeds.feedburner.com/LaGaceta-General',
+            'lagaceta_politica': 'https://www.lagaceta.com.ar/rss/politica.xml',
+            'lagaceta_economia': 'https://www.lagaceta.com.ar/rss/economia.xml',
+            'lagaceta_deportes': 'https://www.lagaceta.com.ar/rss/deportes.xml',
+            'lagaceta_sociedad': 'https://www.lagaceta.com.ar/rss/sociedad.xml',
+            'lagaceta_mundo': 'https://www.lagaceta.com.ar/rss/mundo.xml',
+            'lagaceta_espectaculos': 'https://www.lagaceta.com.ar/rss/espectaculos.xml',
+            'lagaceta_opinion': 'https://www.lagaceta.com.ar/rss/opinion.xml',
+            'pagina12': 'https://www.pagina12.com.ar/rss/portada',
+            'cronista': 'https://www.cronista.com/files/rss/news.xml',
+            'tn': 'https://tn.com.ar/rss',
+            'mdz_politica': 'https://www.mdzol.com/rss/feed.html?r=1',
+            'mdz_opinion': 'https://www.mdzol.com/rss/feed.html?r=4',
+            'mdz_dinero': 'https://www.mdzol.com/rss/feed.html?r=5',
+            'mdz_mundo': 'https://www.mdzol.com/rss/feed.html?r=6',
+            'mdz_sociedad': 'https://www.mdzol.com/rss/feed.html?r=7',
+            'mdz_deportes': 'https://www.mdzol.com/rss/feed.html?r=8',
+            'mdz_sociales': 'https://www.mdzol.com/rss/feed.html?r=9',
+            'mdz_show': 'https://www.mdzol.com/rss/feed.html?r=10',
+            'mdz_espectaculos': 'https://www.mdzol.com/rss/feed.html?r=82',
+            'mdz_policiales': 'https://www.mdzol.com/rss/feed.html?r=84',
+            'mdz_energia': 'https://www.mdzol.com/rss/feed.html?r=90',
+            # Feeds de Ámbito Financiero
+            'ambito_home': 'https://www.ambito.com/rss/pages/home.xml',
+            'ambito_economia': 'https://www.ambito.com/rss/pages/economia.xml',
+            'ambito_ultimas': 'https://www.ambito.com/rss/pages/ultimas-noticias.xml',
+            'ambito_politica': 'https://www.ambito.com/rss/pages/politica.xml',
+            'ambito_tecnologia': 'https://www.ambito.com/rss/pages/tecnologia.xml',
+            # Feeds de La Voz
+            'lavoz_principal': 'http://archivo.lavoz.com.ar/RSS/RSS.asp?origen=1',
+            'lavoz_noticias': 'http://archivo.lavoz.com.ar/RSS/RSS.asp?origen=2',
+            'lavoz_politica': 'http://archivo.lavoz.com.ar/RSS/RSS.asp?categoria=1',
+            'lavoz_negocios': 'http://archivo.lavoz.com.ar/RSS/RSS.asp?categoria=48',
+            'lavoz_ciudadanos': 'http://archivo.lavoz.com.ar/RSS/RSS.asp?categoria=17',
+            'lavoz_deportes': 'http://archivo.lavoz.com.ar/RSS/RSS.asp?categoria=18',
+            'lavoz_cultura': 'http://archivo.lavoz.com.ar/RSS/RSS.asp?categoria=16',
+            'lavoz_internacionales': 'http://archivo.lavoz.com.ar/RSS/RSS.asp?categoria=47',
+            'lavoz_espectaculos': 'http://archivo.lavoz.com.ar/RSS/RSS.asp?categoria=213',
+            'lavoz_opinion': 'http://archivo.lavoz.com.ar/RSS/RSS.asp?categoria=214',
+        }
+
+    noticias = obtener_noticias(feeds)
+    noticias_por_tema = clasificar_noticias(noticias, temas)
+
+    resumen = resumen_noticias(noticias)
+    agenda_senado = obtener_agenda_senado()
+    agenda_diputados = obtener_agenda_diputados()
+    boletin = obtener_boletin()
+
+    from docx import Document
+    doc = Document()
+    doc.add_heading('Informe Diario', 0)
+    doc.add_paragraph('Esquema del documento:')
+    doc.add_paragraph('1. Sesiones del día')
+    doc.add_paragraph('2. Resumen de noticias')
+    doc.add_paragraph('3. Noticias por tema')
+
+    doc.add_heading('Sesiones del día', level=1)
+    if not agenda_diputados.empty:
+        doc.add_heading('Diputados', level=2)
+        for _, row in agenda_diputados.iterrows():
+            doc.add_paragraph(f"{row['fecha']} {row['hora']} - {row['comision']}")
+    if not agenda_senado.empty:
+        doc.add_heading('Senado', level=2)
+        for _, row in agenda_senado.iterrows():
+            doc.add_paragraph(f"{row['fecha']} {row['hora']} - {row['comision']}")
+
+    if boletin:
+        doc.add_paragraph(f"Boletín Oficial: {boletin}")
+
+    doc.add_heading('Resumen de contexto político', level=1)
+    doc.add_paragraph(resumen)
+
+    doc.add_heading('Noticias por tema', level=1)
+    for tema, items in noticias_por_tema.items():
+        doc.add_heading(f"{tema} ({len(items)})", level=2)
+        for n in items:
+            doc.add_paragraph(f"- {n['title']} ({n['feed_name']})")
+
+    nombre = f"informe_{datetime.now().strftime('%Y%m%d')}.docx"
+    doc.save(nombre)
+    print(f"Reporte generado: {nombre}")
+
+
+if __name__ == '__main__':
+    generar_reporte()
